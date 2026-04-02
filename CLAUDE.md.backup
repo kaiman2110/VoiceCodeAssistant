@@ -1,0 +1,789 @@
+# CLAUDE.md — Voice Code Assistant
+
+## プロジェクト概要
+
+音声でClaude Codeに指示を出し、リアルタイムでコーディングタスクを実行するローカルデスクトップツール。
+3つのサービス（Node.jsバックエンド、Python STTサーバー、Reactフロントエンド）で構成される。
+
+詳細設計は `docs/voice-code-assistant-design.md` を参照。
+
+## 環境前提
+
+- Windows + PowerShell
+- Node.js 20+
+- Python 3.11+（CUDA対応GPU必須）
+- Claude CLI 認証済み（`claude login`）
+- パッケージマネージャ: npm
+
+## ディレクトリ構成
+
+```
+voice-code-assistant/
+├── CLAUDE.md                  # このファイル
+├── docs/
+│   └── voice-code-assistant-design.md
+├── server/                    # Node.js バックエンド
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── src/
+│       ├── index.ts           # Express + WebSocket起動
+│       ├── websocket.ts       # WebSocketメッセージハンドラ
+│       ├── agent.ts           # Agent SDK ラッパー
+│       ├── stt-client.ts      # STTサーバー接続クライアント
+│       ├── perf-tracker.ts    # パフォーマンス計測
+│       └── types.ts           # 共有型定義
+├── stt-server/                # Python STTサーバー
+│   ├── main.py                # FastAPI + WebSocket エントリ
+│   ├── transcriber.py         # faster-whisper ラッパー
+│   ├── vad.py                 # Silero VAD ストリーミング
+│   ├── audio_buffer.py        # PCMバッファ管理
+│   └── requirements.txt
+├── client/                    # React フロントエンド
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   ├── index.html
+│   └── src/
+│       ├── App.tsx
+│       ├── main.tsx
+│       ├── components/
+│       │   ├── ChatPanel.tsx
+│       │   ├── MessageList.tsx
+│       │   ├── VoiceButton.tsx
+│       │   ├── TextInput.tsx
+│       │   ├── StatusBar.tsx
+│       │   └── PerfDashboard.tsx
+│       ├── hooks/
+│       │   ├── useWebSocket.ts
+│       │   ├── useVoiceRecorder.ts
+│       │   ├── useAgentStream.ts
+│       │   └── usePerfMetrics.ts
+│       ├── stores/
+│       │   ├── chatStore.ts
+│       │   └── perfStore.ts
+│       └── types.ts
+└── docker-compose.yml
+```
+
+---
+
+## 実装タスク（Phase 1 MVP）
+
+以下の順番で実装する。各タスクは独立してテスト可能な単位になっている。
+
+---
+
+### Task 1: プロジェクト初期化
+
+ルート、server、client それぞれの初期化を行う。
+
+**server/package.json の依存関係:**
+```json
+{
+  "name": "voice-code-assistant-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest",
+    "express": "^4.21",
+    "ws": "^8.18",
+    "uuid": "^10"
+  },
+  "devDependencies": {
+    "@types/express": "^5",
+    "@types/ws": "^8",
+    "@types/uuid": "^10",
+    "tsx": "^4",
+    "typescript": "^5.5"
+  }
+}
+```
+
+**server/tsconfig.json:**
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true
+  },
+  "include": ["src"]
+}
+```
+
+**client は Vite + React + TypeScript テンプレートで初期化:**
+```bash
+cd client
+npm create vite@latest . -- --template react-ts
+npm install zustand recharts
+npm install -D tailwindcss @tailwindcss/vite
+```
+
+Tailwind は vite.config.ts に `@tailwindcss/vite` プラグインとして追加し、`src/index.css` に `@import "tailwindcss"` を記載する方式（v4）。
+
+**stt-server/requirements.txt:**
+```
+fastapi==0.115.*
+uvicorn[standard]==0.34.*
+websockets==14.*
+faster-whisper==1.1.*
+silero-vad==5.*
+numpy==1.*
+pydub==0.25.*
+```
+
+**完了条件:**
+- `cd server && npm install && npx tsx src/index.ts` でExpressが3000番で起動する（空のindex.ts + Expressリッスンのみ）
+- `cd client && npm install && npm run dev` でViteが5173番で起動する
+- `cd stt-server && pip install -r requirements.txt` が成功する
+
+---
+
+### Task 2: 共有型定義
+
+`server/src/types.ts` にWebSocketプロトコルの型を定義する。
+`client/src/types.ts` にも同じ型をコピーする（Phase 1ではモノレポ共有はスキップ）。
+
+```typescript
+// --- Client → Server メッセージ ---
+
+export interface AudioChunkMessage {
+  type: "audio_chunk";
+  data: string;           // base64エンコード済みバイナリ
+  chunkIndex: number;
+}
+
+export interface RecordingStartMessage {
+  type: "recording_start";
+  timestamp: number;
+}
+
+export interface RecordingStopMessage {
+  type: "recording_stop";
+  timestamp: number;
+}
+
+export interface TextInputMessage {
+  type: "text_input";
+  text: string;
+}
+
+export interface SetPermissionMessage {
+  type: "set_permission";
+  level: "readonly" | "edit" | "full";
+}
+
+export type ClientMessage =
+  | AudioChunkMessage
+  | RecordingStartMessage
+  | RecordingStopMessage
+  | TextInputMessage
+  | SetPermissionMessage;
+
+// --- Server → Client メッセージ ---
+
+export interface VadStatusMessage {
+  type: "vad_status";
+  speaking: boolean;
+  timestamp: number;
+}
+
+export interface TranscriptionMessage {
+  type: "transcription";
+  text: string;
+  confidence: number;
+  sttLatencyMs: number;
+}
+
+export interface AssistantTextMessage {
+  type: "assistant_text";
+  text: string;
+  done: boolean;
+}
+
+export interface ToolStartMessage {
+  type: "tool_start";
+  tool: string;
+  input: Record<string, unknown>;
+}
+
+export interface ToolResultMessage {
+  type: "tool_result";
+  tool: string;
+  output: string;
+  durationMs: number;
+}
+
+export interface PerfMetricsMessage {
+  type: "perf_metrics";
+  data: PerformanceMetrics;
+}
+
+export interface ErrorMessage {
+  type: "error";
+  message: string;
+  code: string;
+}
+
+export interface StatusMessage {
+  type: "status";
+  stt: "ready" | "processing";
+  agent: "idle" | "running";
+}
+
+export type ServerMessage =
+  | VadStatusMessage
+  | TranscriptionMessage
+  | AssistantTextMessage
+  | ToolStartMessage
+  | ToolResultMessage
+  | PerfMetricsMessage
+  | ErrorMessage
+  | StatusMessage;
+
+// --- パフォーマンスメトリクス ---
+
+export interface PerformanceMetrics {
+  requestId: string;
+  timestamp: string;
+  sttLatencyMs: number;
+  sttConfidence: number;
+  audioDurationMs: number;
+  agentFirstChunkLatencyMs: number;
+  agentTotalLatencyMs: number;
+  e2eFirstResponseMs: number;
+  e2eTotalMs: number;
+  toolsUsed: string[];
+  toolCount: number;
+  inputText: string;
+  inputCharCount: number;
+  outputCharCount: number;
+}
+
+// --- ツール許可レベル ---
+
+export const TOOL_LEVELS = {
+  readonly: ["Read", "Grep", "Glob", "LS"],
+  edit: ["Read", "Grep", "Glob", "LS", "Write", "Edit", "MultiEdit"],
+  full: ["Read", "Grep", "Glob", "LS", "Write", "Edit", "MultiEdit", "Bash"],
+} as const;
+
+export type PermissionLevel = keyof typeof TOOL_LEVELS;
+```
+
+---
+
+### Task 3: Node.js バックエンド — Express + WebSocket
+
+`server/src/index.ts`:
+- Express を port 3000 で起動
+- `ws` ライブラリで WebSocket サーバーを Express の HTTP サーバーに相乗り
+- CORS ヘッダーを設定（localhost:5173 許可）
+- ヘルスチェック GET `/health`
+
+`server/src/websocket.ts`:
+- WebSocket 接続管理
+- ClientMessage をパースしてハンドラにディスパッチ
+- ServerMessage を JSON シリアライズして送信するヘルパー `send(ws, message)`
+- 接続/切断ログ
+
+**完了条件:**
+- wscat や websocat で `ws://localhost:3000` に接続できる
+- JSON メッセージを送ると型に基づいてパース・ログ出力される
+
+---
+
+### Task 4: Python STT サーバー
+
+`stt-server/main.py`:
+- FastAPI アプリ、uvicorn で port 8001 起動
+- WebSocket エンドポイント `/ws/transcribe`
+- ヘルスチェック GET `/health`（モデルロード状態を返す）
+- 起動時に faster-whisper モデルをプリロード
+
+`stt-server/transcriber.py`:
+```python
+from faster_whisper import WhisperModel
+
+class Transcriber:
+    def __init__(self, model_size: str = "large-v3", device: str = "cuda", compute_type: str = "float16"):
+        self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+    def transcribe(self, audio_pcm: np.ndarray, sample_rate: int = 16000) -> dict:
+        """PCM float32 配列を文字起こし。結果を dict で返す。"""
+        start = time.perf_counter()
+        segments, info = self.model.transcribe(
+            audio_pcm,
+            beam_size=5,
+            language="ja",
+            vad_filter=False,  # 自前のVADを使うのでオフ
+        )
+        text = "".join(seg.text for seg in segments)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        return {
+            "text": text.strip(),
+            "confidence": round(info.language_probability, 3),
+            "stt_latency_ms": round(elapsed_ms),
+        }
+```
+
+`stt-server/vad.py`:
+```python
+import torch
+from silero_vad import load_silero_vad, get_speech_timestamps
+
+class VoiceActivityDetector:
+    def __init__(self, threshold: float = 0.5, silence_duration_ms: int = 500, sample_rate: int = 16000):
+        self.model = load_silero_vad()
+        self.threshold = threshold
+        self.silence_duration_ms = silence_duration_ms
+        self.sample_rate = sample_rate
+
+    def is_speech(self, audio_chunk: torch.Tensor) -> bool:
+        """単一チャンクに対して発話中かどうかを判定"""
+        confidence = self.model(audio_chunk, self.sample_rate).item()
+        return confidence >= self.threshold
+```
+
+`stt-server/audio_buffer.py`:
+- PCM float32 の numpy 配列をチャンクごとに蓄積
+- base64 エンコードされた WebM/Opus データを受け取り → pydub で PCM 16kHz mono に変換 → バッファに追加
+- `flush()` でバッファ全体を返してリセット
+
+**WebSocket通信フロー（main.py）:**
+1. クライアント（Node.js backend）から base64 音声チャンクを受信
+2. audio_buffer にデコード・追加
+3. VAD でチャンクを評価し `{"vad_status": speaking}` を返送
+4. 無音を `silence_duration_ms` 以上検出 → バッファを flush → transcriber.transcribe() → 結果を JSON で返送
+5. `recording_stop` メッセージ受信時もバッファを flush して文字起こし実行
+
+**完了条件:**
+- `uvicorn main:app --host 0.0.0.0 --port 8001` で起動
+- `/health` が `{"status": "ready", "model": "large-v3"}` を返す
+- WebSocket 経由で base64 音声を送ると文字起こし結果が返る
+
+---
+
+### Task 5: Node.js → STT サーバー接続
+
+`server/src/stt-client.ts`:
+- Node.js の `ws` ライブラリで `ws://localhost:8001/ws/transcribe` に接続
+- フロントから受けた audio_chunk を STT サーバーに転送
+- STT サーバーからの transcription / vad_status を受信してコールバック発火
+- 再接続ロジック（5秒間隔リトライ）
+
+**完了条件:**
+- Node.js backend 起動時に STT サーバーへの接続を試行
+- STT サーバーが落ちていてもクラッシュせずリトライし続ける
+
+---
+
+### Task 6: Agent SDK 統合
+
+`server/src/agent.ts`:
+
+```typescript
+import { query } from "@anthropic-ai/claude-agent-sdk";
+import { TOOL_LEVELS, PermissionLevel } from "./types.js";
+
+interface AgentCallbacks {
+  onText: (text: string, done: boolean) => void;
+  onToolStart: (tool: string, input: Record<string, unknown>) => void;
+  onToolResult: (tool: string, output: string, durationMs: number) => void;
+  onComplete: () => void;
+  onError: (error: Error) => void;
+}
+
+export async function executePrompt(
+  prompt: string,
+  cwd: string,
+  permissionLevel: PermissionLevel,
+  callbacks: AgentCallbacks
+): Promise<void> {
+  const allowedTools = TOOL_LEVELS[permissionLevel];
+
+  try {
+    const stream = query({
+      prompt,
+      options: {
+        cwd,
+        allowedTools: [...allowedTools],
+        permissionMode: permissionLevel === "readonly" ? "default" : "acceptEdits",
+      },
+    });
+
+    for await (const message of stream) {
+      // SDKMessage の type に応じて callbacks を呼ぶ
+      // 実際の型は SDK のドキュメントを確認して適宜マッピングする
+      // 主要な type: "assistant", "tool_use", "tool_result", "result"
+      if (message.type === "assistant" && "content" in message) {
+        // テキストコンテンツを抽出
+        callbacks.onText(extractText(message), false);
+      } else if (message.type === "tool_use") {
+        callbacks.onToolStart(message.name ?? "unknown", message.input ?? {});
+      } else if (message.type === "tool_result") {
+        callbacks.onToolResult(message.name ?? "unknown", extractText(message), 0);
+      } else if (message.type === "result") {
+        callbacks.onText("", true);
+        callbacks.onComplete();
+      }
+    }
+  } catch (error) {
+    callbacks.onError(error instanceof Error ? error : new Error(String(error)));
+  }
+}
+
+function extractText(message: any): string {
+  // SDK メッセージからテキストを抽出するヘルパー
+  // message.content が配列の場合は text type のブロックを結合
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) {
+    return message.content
+      .filter((b: any) => b.type === "text")
+      .map((b: any) => b.text)
+      .join("");
+  }
+  return "";
+}
+```
+
+**重要: Agent SDK のメッセージ型は実装時に確認すること。**
+`@anthropic-ai/claude-agent-sdk` の `query()` が返す `SDKMessage` の正確な型定義を確認し、
+上記の `message.type` 分岐を実際のSDKに合わせて修正する。
+`npm run dev` 時にテストプロンプト（"Hello, what files are in this directory?"）を投げて
+メッセージのログを取り、型マッピングを検証する。
+
+**完了条件:**
+- テスト用のスクリプトで `executePrompt("このディレクトリの構成を教えて", process.cwd(), "readonly", ...)` を実行
+- コールバック経由でストリーミングテキストが受信できる
+
+---
+
+### Task 7: パフォーマンス計測
+
+`server/src/perf-tracker.ts`:
+
+```typescript
+import { PerformanceMetrics } from "./types.js";
+import { appendFileSync, mkdirSync, existsSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+
+export class PerfTracker {
+  private metrics: Partial<PerformanceMetrics> = {};
+  private requestId: string;
+  private logDir: string;
+
+  constructor(requestId: string) {
+    this.requestId = requestId;
+    this.logDir = join(homedir(), ".voice-code-assistant", "perf-logs");
+    if (!existsSync(this.logDir)) mkdirSync(this.logDir, { recursive: true });
+  }
+
+  markSttCompleted(sttLatencyMs: number, confidence: number, audioDurationMs: number, text: string) { ... }
+  markAgentStarted() { ... }
+  markAgentFirstChunk() { ... }
+  markAgentCompleted(toolsUsed: string[], toolCount: number, outputCharCount: number) { ... }
+
+  finalize(): PerformanceMetrics {
+    // 全フィールドを計算して返す
+    // e2eFirstResponseMs = agentFirstChunkAt - recordingStoppedAt (STT完了時刻をベースに)
+    // JSONL にも書き出す
+  }
+
+  private persistLog(metrics: PerformanceMetrics) {
+    const date = new Date().toISOString().split("T")[0];
+    const filepath = join(this.logDir, `${date}.jsonl`);
+    appendFileSync(filepath, JSON.stringify(metrics) + "\n");
+  }
+}
+```
+
+**完了条件:**
+- リクエストごとに `~/.voice-code-assistant/perf-logs/YYYY-MM-DD.jsonl` にログが追記される
+- finalize() が PerformanceMetrics 型のオブジェクトを返す
+
+---
+
+### Task 8: WebSocket ハンドラ統合
+
+`server/src/websocket.ts` に全てを統合する。
+
+フロント → WebSocket メッセージ受信時の処理フロー:
+
+1. `recording_start` → PerfTracker 生成、STT client に開始通知
+2. `audio_chunk` → base64 データを STT client に転送
+3. `recording_stop` → STT client に停止通知
+4. `text_input` → 直接 Task 8b へ（STTスキップ）
+5. `set_permission` → 現在の permission level を更新
+
+STT client からの受信:
+
+6. `vad_status` → フロントにそのまま転送
+7. `transcription` → PerfTracker に STT 完了を記録 → Task 8b へ
+
+Agent SDK 実行（8b）:
+
+8. `executePrompt()` を呼び出し、callbacks で:
+   - `onText` → `assistant_text` をフロントに送信（ストリーミング）
+   - `onToolStart` → `tool_start` をフロントに送信
+   - `onToolResult` → `tool_result` をフロントに送信
+   - `onComplete` → PerfTracker.finalize() → `perf_metrics` をフロントに送信
+   - `onError` → `error` をフロントに送信
+
+**同時実行の制御:**
+- Agent SDK 実行中に新しいリクエストが来た場合はキューイングする（Phase 1 では単純な排他制御でOK）
+- `status` メッセージで現在の状態（agent: idle/running）をフロントに通知
+
+**cwd の設定:**
+- Phase 1 では環境変数 `VCA_PROJECT_DIR` またはデフォルトで `process.cwd()` を使う
+
+**完了条件:**
+- フロントから音声送信 → STT → Agent SDK → ストリーミング応答 → パフォーマンスメトリクス の一連のフローが動作する
+- テキスト直接入力でも同じフローが動く
+
+---
+
+### Task 9: React フロントエンド — 基本UI
+
+**状態管理（Zustand）:**
+
+`client/src/stores/chatStore.ts`:
+```typescript
+interface ChatMessage {
+  id: string;
+  role: "user" | "assistant" | "tool";
+  content: string;
+  timestamp: number;
+  // tool 関連
+  toolName?: string;
+  toolInput?: Record<string, unknown>;
+  toolOutput?: string;
+  toolDurationMs?: number;
+}
+
+interface ChatState {
+  messages: ChatMessage[];
+  isAgentRunning: boolean;
+  isSttProcessing: boolean;
+  currentStreamingText: string;
+  permissionLevel: PermissionLevel;
+  addMessage: (msg: ChatMessage) => void;
+  appendStreamingText: (text: string) => void;
+  finalizeStreaming: () => void;
+  setAgentRunning: (v: boolean) => void;
+  setPermissionLevel: (level: PermissionLevel) => void;
+}
+```
+
+`client/src/stores/perfStore.ts`:
+```typescript
+interface PerfState {
+  metrics: PerformanceMetrics[];       // セッション内の全メトリクス
+  latestMetrics: PerformanceMetrics | null;
+  addMetrics: (m: PerformanceMetrics) => void;
+  // 統計計算用 getter
+  getAverageSttLatency: () => number;
+  getAverageE2eFirstResponse: () => number;
+  getP95TotalLatency: () => number;
+}
+```
+
+**完了条件:**
+- Zustand ストアが動作し、メッセージ追加・ストリーミングテキスト更新ができる
+
+---
+
+### Task 10: React — WebSocket フック
+
+`client/src/hooks/useWebSocket.ts`:
+- `ws://localhost:3000` に接続
+- 自動再接続（3秒間隔）
+- `ServerMessage` を受信して chatStore / perfStore を更新
+- `sendMessage(msg: ClientMessage)` を返す
+
+`client/src/hooks/useVoiceRecorder.ts`:
+- `MediaRecorder` API で音声を録音
+- Push-to-Talk: ボタン押下で `start()`、リリースで `stop()`
+- 250ms 間隔で `ondataavailable` → base64 変換 → `sendMessage({ type: "audio_chunk", ... })`
+- 録音開始時に `recording_start`、終了時に `recording_stop` を送信
+- MediaRecorder の mimeType は `audio/webm;codecs=opus`（ブラウザサポート確認）
+
+**完了条件:**
+- ブラウザでマイク許可後、ボタン押下中に音声データが WebSocket 経由で送信される
+- サーバーから `transcription` を受信して chatStore に反映される
+
+---
+
+### Task 11: React — UI コンポーネント
+
+全体レイアウト（`App.tsx`）:
+- 上部: ヘッダー（プロジェクト名表示、Phase 1 では固定）
+- 中央: ChatPanel（メッセージリスト + 入力エリア）
+- 下部: StatusBar
+
+`components/ChatPanel.tsx`:
+- MessageList と InputArea を縦に配置
+- flex-1 でメッセージリストが伸縮
+
+`components/MessageList.tsx`:
+- chatStore.messages をマップしてレンダリング
+- `role: "user"` → 右寄せ吹き出し（認識テキスト表示）
+- `role: "assistant"` → 左寄せ、ストリーミング中はタイピングインジケータ
+- `role: "tool"` → インデント + ツール名 + 折りたたみ可能な入出力
+- currentStreamingText をリアルタイム表示
+- 最新メッセージへの自動スクロール
+
+`components/VoiceButton.tsx`:
+- 大きめの円形ボタン（マイクアイコン）
+- `onMouseDown` / `onMouseUp`（デスクトップ）と `onTouchStart` / `onTouchEnd`（モバイル）
+- 押下中: 赤いパルスアニメーション + 「録音中...」表示
+- VAD状態に応じて音声レベルインジケータ
+
+`components/TextInput.tsx`:
+- テキストフォールバック入力
+- Enter で送信、Shift+Enter で改行
+- Agent実行中は disabled
+
+`components/StatusBar.tsx`:
+- 左: 接続状態アイコン（WebSocket / STT の接続状態）
+- 中央: 直近リクエストのレイテンシ表示
+  - STT: Xms | TTFB: Xs | Total: Xs
+  - 色分け: 緑 < 3s、黄 < 6s、赤 > 6s
+- 右: 現在の権限レベル（readonly / edit / full トグルボタン）
+
+**スタイリング方針:**
+- ダーク基調のターミナル風UI
+- Tailwind CSS を使用
+- 背景: slate-900、テキスト: slate-100
+- アクセント: cyan（Agent応答）、amber（ツール実行）、emerald（STT完了）
+
+**完了条件:**
+- Push-to-Talk で録音 → 文字起こし表示 → Agent 応答ストリーミング表示 → ツール実行表示
+- テキスト入力でも同じフロー
+- StatusBar にリアルタイムレイテンシが表示される
+
+---
+
+### Task 12: docker-compose（オプション）
+
+```yaml
+version: "3.8"
+services:
+  stt-server:
+    build: ./stt-server
+    ports:
+      - "8001:8001"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  server:
+    build: ./server
+    ports:
+      - "3000:3000"
+    environment:
+      - STT_SERVER_URL=ws://stt-server:8001/ws/transcribe
+      - VCA_PROJECT_DIR=/workspace
+    volumes:
+      - ${VCA_PROJECT_DIR:-.}:/workspace
+    depends_on:
+      - stt-server
+
+  client:
+    build: ./client
+    ports:
+      - "5173:5173"
+    depends_on:
+      - server
+```
+
+---
+
+## 設定と環境変数
+
+| 変数名 | デフォルト | 説明 |
+|--------|-----------|------|
+| `PORT` | `3000` | Node.js バックエンドのポート |
+| `STT_SERVER_URL` | `ws://localhost:8001/ws/transcribe` | STT サーバーの WebSocket URL |
+| `VCA_PROJECT_DIR` | `process.cwd()` | Agent SDK に渡す作業ディレクトリ |
+| `STT_MODEL_SIZE` | `large-v3` | faster-whisper モデルサイズ |
+| `STT_DEVICE` | `cuda` | faster-whisper デバイス |
+| `STT_COMPUTE_TYPE` | `float16` | faster-whisper 計算精度 |
+| `VAD_THRESHOLD` | `0.5` | Silero VAD 発話判定閾値 |
+| `VAD_SILENCE_MS` | `500` | 無音判定ミリ秒 |
+
+---
+
+## 開発時の起動手順
+
+ターミナル3つ（PowerShell）で並列起動:
+
+```powershell
+# Terminal 1: STT サーバー
+cd stt-server
+python -m uvicorn main:app --host 0.0.0.0 --port 8001
+
+# Terminal 2: Node.js バックエンド
+cd server
+npm run dev
+
+# Terminal 3: React フロントエンド
+cd client
+npm run dev
+```
+
+ブラウザで `http://localhost:5173` を開く。
+
+---
+
+## 実装時の注意事項
+
+### Agent SDK
+- `@anthropic-ai/claude-agent-sdk` は `claude login` 済みの環境でのみ動作する
+- API キー不要（Max plan のクォータを使用）
+- `query()` が返す AsyncGenerator の SDKMessage の正確な型は、実装時に SDK のソースまたは型定義ファイルを確認すること
+- `permissionMode: "acceptEdits"` はファイル編集を自動承認する。readonly モードでは "default" を使う
+
+### 音声処理
+- ブラウザの MediaRecorder は `audio/webm;codecs=opus` で出力する
+- Python 側では pydub で PCM 16kHz mono float32 に変換する
+- pydub は ffmpeg に依存するので、ffmpeg がシステムにインストールされている必要がある
+
+### パフォーマンス
+- STT 推論中は GPU を専有するため、同時リクエストは避ける
+- faster-whisper のモデルロードには初回30秒程度かかる。ヘルスチェックで ready を確認してから接続する
+- Agent SDK のストリーミング応答は最初のチャンクが来るまで数秒かかる場合がある。フロントでローディングUI を表示する
+
+### エラーハンドリング（Phase 1 最低限）
+- STT サーバー未起動時: バックエンドが再接続を試み、フロントに `status` メッセージで通知
+- Agent SDK エラー: `error` メッセージでフロントに通知、チャットに赤字で表示
+- マイク許可拒否: VoiceButton を無効化、テキスト入力のみ利用可能にする
+
+---
+
+## Phase 2 以降の実装メモ
+
+Phase 1 完了後に着手する項目。詳細は設計ドキュメント参照。
+
+- **Diff 表示**: Agent SDK の tool_result から変更ファイルパスを抽出 → `diff` コマンドで差分取得 → フロント表示
+- **プロジェクト切替**: `VCA_PROJECT_DIR` を動的に変更するUI + `switch_project` メッセージ
+- **PerfDashboard**: Recharts で積み上げ棒グラフ + P50/P95 統計テーブル
+- **会話履歴永続化**: SQLite or JSONL でメッセージを保存
+- **VOICEVOX 連携**: TTS サーバー（localhost:50021）にテキスト送信 → wav 受信 → フロント再生
+- **ウェイクワード**: openWakeWord を STT サーバーに統合、常時 VAD + キーワード検出
