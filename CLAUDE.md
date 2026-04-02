@@ -1,9 +1,12 @@
 # VoiceCodeAssistant
 
 ## プロジェクト概要
-- エンジン/フレームワーク: 
+音声で Claude Code に指示を出し、結果表示+レイテンシ可視化を行うアシスタント。
+
+- エンジン/フレームワーク: Node.js (バックエンド) / Python (STTサーバー) / React (フロントエンド)
 - リポジトリ: https://github.com/kaiman2110/VoiceCodeAssistant
 - テスト: (未設定) (`echo 'テストコマンド未設定'`)
+- ロードマップ: `docs/roadmap.md`
 
 ## アーキテクチャ原則
 <!-- プロジェクト固有の原則を記載。例: EventBus 経由の疎結合通信 -->
